@@ -27,7 +27,11 @@ $(BIN_DIR)/jobCommander: $(BUILD_DIR)/jobCommander.o
 $(BIN_DIR)/jobExecutorServer: $(filter-out $(BUILD_DIR)/jobCommander.o, $(OBJS))
 		$(CC) $(CFLAGS) -pthread $^ -o $@
 
-build/%.o : $(SOURCE_DIR)/%.c
+$(BUILD_DIR)/%.o : $(SOURCE_DIR)/%.c
+		mkdir -p $(BUILD_DIR)
+		mkdir -p $(BIN_DIR)
+		mkdir -p lib
+		mkdir -p tests
 		$(COMPILE.c) $(OUTPUT_OPTION) $<
 
 clean:
