@@ -11,6 +11,7 @@ typedef struct Job {
     pid_t pid;
     char* description;
     int description_argc;
+    int description_len;
 //    QueueNode node;
 }Job;
 
@@ -20,9 +21,11 @@ typedef struct ring_buffer {
     int start;
     int end;
     int count;
+    int concurrency_level;
 } ring_buffer;
 void rbuffer_init(ring_buffer*, int);
 Job* rbuffer_getJob(ring_buffer*, int);
+Job* rbuffer_remove(ring_buffer*, int);
 Job* rbuffer_dequeue(ring_buffer*);
 Job* rbuffer_enqueue(ring_buffer*, Job*);
 void rbuffer_destroy(ring_buffer*);

@@ -18,9 +18,14 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <protocol.h>
+#include <sys/wait.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
 #define BACKLOG 20
+#define ID_MAX_DIGITS 20
 void* controllerThread(void* arg);
 void* workerThread(void* arg);
+char** tokenize(const char* input, int num_tokens);
 typedef struct thread_args{
     int sockfd;
     ring_buffer* buffer;
@@ -29,7 +34,7 @@ static pthread_cond_t cond_worker = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t cond_controller = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t mutex_cond = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t mutex_freelist = PTHREAD_MUTEX_INITIALIZER;
-int num_items = 20;
+int num_workers = 0;
 int quit;
 int main(int argc, char** argv){
     int sockfd, newsockfd;
@@ -144,11 +149,17 @@ void* controllerThread(void* arg){
         bytes_read += nbytes;
     }
     // char* job_description = NULL;
+    char* response_buffer = NULL;
+    int n = 0; //response_buffer len;
+    struct iovec* iov;
+    struct msghdr msg;
     switch (rqh.command_num) {
         case 1:
             Job *job = malloc(sizeof(Job));
             job->pid = -1;
             bytes_read = 0;
+            job->description = malloc(rqh.message+1);
+            job->description[rqh.message] = '\0';
             while (bytes_read < rqh.message) {
                 int nbytes = recv(args->sockfd, job->description + bytes_read, rqh.message - bytes_read, 0);
                 if (nbytes == -1) {
@@ -158,6 +169,7 @@ void* controllerThread(void* arg){
                 bytes_read += nbytes;
             }
             job->description_argc = rqh.arg_count;
+            job->description_len  = rqh.message;
             pthread_mutex_lock(&mutex_cond);
             while (args->buffer->count >= args->buffer->size) {
                 pthread_cond_wait(&cond_controller, &mutex_cond);
@@ -172,11 +184,38 @@ void* controllerThread(void* arg){
             }
             break;
         case 2:
-
+            pthread_mutex_lock(&mutex_cond);
+            job = rbuffer_remove(args->buffer,rqh.message);
+            pthread_mutex_unlock(&mutex_cond);
+            response_buffer = malloc(strlen("JOB  NOTFOUND.")+ID_MAX_DIGITS+1); //20 gia MAX psifia kai 1 gia nullbyte
+            if(job!=NULL){
+                n = sprintf(response_buffer, "JOB %d REMOVED.", rqh.message) + 1;
+            }
+            else{
+                n = sprintf(response_buffer, "JOB %d NOTFOUND.", rqh.message) + 1;
+            }
+            send(args->sockfd,response_buffer,n,0);
+            free(response_buffer);
             break;
         case 3:
+            pthread_mutex_lock(&mutex_cond);
+            iov = malloc(args->buffer->count+1*sizeof(struct iovec));
+            // iov[0].iov_base =
+            int iov_idx = 1;
+            int total_len = 0;
+            for (int i = args->buffer->start; i != args->buffer->end; i = (++i == args->buffer->size ? 0 : i)){
+                iov[iov_idx].iov_base = args->buffer->jobs[i]->description;
+                iov[iov_idx].iov_len = args->buffer->jobs[i]->description_len;
+                // iov[iov_idx].iov_base[iov[iov_idx].iov_len] = '\n';
+                total_len += (args->buffer->jobs[i]->description_len + 1);
+            }
+            iov[0].iov_base = &total_len;
+            iov[0].iov_len = sizeof(int);
+            sendmsg(args->sockfd,&msg,0);
+            pthread_mutex_lock(&mutex_cond);
             break;
         case 4:
+
             break;
         case 5:
             break;
@@ -189,20 +228,80 @@ void* controllerThread(void* arg){
 
 void* workerThread(void* arg){
     thread_args* args = arg;
-    ring_buffer* buffer = args->buffer;
-    while(num_items>=0){
+    args->buffer;
+    while(!quit){
         pthread_mutex_lock(&mutex_cond);
-        while(buffer->count == 0){
+        while(args->buffer->count == 0 && num_workers == args->buffer->concurrency_level){
             pthread_cond_wait(&cond_worker,&mutex_cond);
-            if(num_items<0){
+            if(quit){
                 return NULL;
             }
         }
-        Job* job = rbuffer_dequeue(buffer);
+        num_workers++;
+        Job* job = rbuffer_dequeue(args->buffer);
         pthread_mutex_unlock(&mutex_cond);
         pthread_cond_signal(&cond_controller);
-        printf("Worker thread obtained job_%d\n",job->id);
+        char buffer[strlen(".output")+ID_MAX_DIGITS+1];
+        buffer[0] = '\0';
+        pid_t pid = fork();
+        sprintf(buffer,"%d.output",job->id);
+        if(pid == -1){
+            perror("fork");
+            exit(EXIT_FAILURE);
+        }
+        if(pid == 0) {
+            char** job_args = tokenize(job->description, job->description_argc);
+            int output_fd = open(buffer, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            dup2(STDOUT_FILENO,output_fd);
+            close(STDOUT_FILENO);
+            execvp(job_args[0],job_args);
+            exit(EXIT_FAILURE);
+        }
+        waitpid(pid,NULL, 0);
+        int output_fd = open(buffer, O_RDONLY);
+        char bumper[strlen("-----job_ output start---") + ID_MAX_DIGITS + 1];
+        bumper[sizeof(bumper)-1] = '\0';
+        int n = sprintf(bumper, "----job_%d output start----", job->id);
+        write(args->sockfd, bumper, n+1);
+        struct stat st;
+        lstat(buffer, &st);
+        sendfile(args->sockfd, output_fd, 0, st.st_size);
+        memset(bumper, 0, sizeof(bumper));
+        sprintf(bumper, "----job_%d output end------", job->id);
+        write(args->sockfd, bumper, n+1);
         free(job);
+        // printf("Worker thread obtained job_%d\n",job->id);
     }
     return NULL;
+}
+
+char** tokenize(const char* input, int num_tokens) { //tokenize with space delimeter and keep quotes intact
+    char* str = strdup(input);
+    char** result = malloc((num_tokens + 1) * sizeof(char*)); // allocate memory for the known number of tokens
+    int count = 0;
+    char* token_start = str; //start of 1st token is the start of stirng
+    int in_quotes = 0; //state for quotes
+    //parse string
+    for (char* p = str; *p; ++p) {
+        if (*p == '\"' || *p == '\'') { //quotes beginning
+            in_quotes = !in_quotes;
+        }
+        else if (*p == ' ' && !in_quotes) { //found a token, if we are not in quotes
+            *p = '\0'; //the current token ends here
+            result[count++] = strdup(token_start); //add the token to the list
+            token_start = p + 1; //start new token
+        }
+    }
+
+    // add the last token
+    if (token_start != str + strlen(str)) {
+        result[count++] = strdup(token_start);
+    }
+    result[num_tokens] = NULL;  // Null terminate the list of tokens
+    //    printf("count: %d num_tokens: %d\n",count,num_tokens);
+    //    for (int i = 0; i < count; i++) {
+    //        printf("%s ",result[i]);
+    //    }
+    free(str);
+    return result;
 }
