@@ -29,6 +29,7 @@ char** tokenize(const char* input, int num_tokens);
 typedef struct thread_args{
     int sockfd;
     ring_buffer* buffer;
+    int exit_pipe;
 } thread_args;
 static pthread_cond_t cond_worker = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t cond_controller = PTHREAD_COND_INITIALIZER;
@@ -90,6 +91,7 @@ int main(int argc, char** argv){
     args.buffer = &buffer;
     int exit_pipe[2];
     pipe2(exit_pipe,O_NONBLOCK);
+    args.exit_pipe = exit_pipe[1];
     struct pollfd pollfds[2];
     pollfds[0].fd = sockfd;
     pollfds[0].events = POLLIN;
@@ -110,6 +112,11 @@ int main(int argc, char** argv){
             char c;
             read(exit_pipe[0],&c,1);
             if(c=='q'){
+                pthread_cond_broadcast(&cond_worker);
+                pthread_cond_broadcast(&cond_controller);
+                for(int i=0;i<threadsNum;i++){
+                    pthread_join(w_threads[i],NULL);
+                }
                 break;
             }
         }
@@ -218,6 +225,14 @@ void* controllerThread(void* arg){
 
             break;
         case 5:
+            write(args->exit_pipe,"q",1);
+            pthread_mutex_lock(&mutex_cond);
+            for (int i = args->buffer->start; i != args->buffer->end; i = (++i == args->buffer->size ? 0 : i)){
+                free(args->buffer->jobs[i]->description);
+                free(args->buffer->jobs[i]);
+                free(args->buffer->jobs);
+            }
+            pthread_mutex_unlock(&mutex_cond);
             break;
         default:
             break;
