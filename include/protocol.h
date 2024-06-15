@@ -29,6 +29,7 @@ typedef struct request_header{
 // } jobTwople;
 
 typedef struct response_header{
+
     // int int1; //queuePos or number of jobs or -1
     // int len; //length of all descriptions or one job description or message or -1
     // int id; /* if id=-1,then

@@ -5,6 +5,7 @@
 #define _GNU_SOURCE             /* See feature_test_macros(7) */
 
 #include <errno.h>
+#include <sys/mman.h>
 #include <list.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,17 +27,23 @@
 void* controllerThread(void* arg);
 void* workerThread(void* arg);
 char** tokenize(const char* input, int num_tokens);
+
 typedef struct thread_args{
     int sockfd;
     ring_buffer* buffer;
     int exit_pipe;
 } thread_args;
+
+
 static pthread_cond_t cond_worker = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t cond_controller = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t mutex_cond = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t mutex_freelist = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_concurrency = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_jid = PTHREAD_MUTEX_INITIALIZER;
+int concurrency_level=1;
+int job_id = 1;
 int num_workers = 0;
-int quit;
+int quit = 0;
 int main(int argc, char** argv){
     int sockfd, newsockfd;
     char* portnum = argv[1];
@@ -98,9 +105,8 @@ int main(int argc, char** argv){
     pollfds[1].fd = exit_pipe[0];
     pollfds[1].events = POLLIN;
     for(int i=0;i<threadsNum;i++){
-        pthread_create(&w_threads[i],NULL,workerThread,&args);
+    pthread_create(&w_threads[i],NULL,workerThread,&args);
     }
-
     for (;;){
         while(poll(pollfds,2,-1)==-1){ //re-poll if EINTR occurs
             if(errno != EINTR){
@@ -112,6 +118,7 @@ int main(int argc, char** argv){
             char c;
             read(exit_pipe[0],&c,1);
             if(c=='q'){
+                quit =1;
                 pthread_cond_broadcast(&cond_worker);
                 pthread_cond_broadcast(&cond_controller);
                 for(int i=0;i<threadsNum;i++){
@@ -126,6 +133,28 @@ int main(int argc, char** argv){
                 perror("accept");
                 exit(EXIT_FAILURE);
             }
+            /*request_header rqh;
+            recv(newsockfd,&rqh,sizeof(request_header),0);
+            if (rqh.command_num == 5) {
+                int nbytes = strlen("SERVER TERMINATED");
+                send(newsockfd, &nbytes, sizeof(int), 0);
+                send(newsockfd, "SERVER TERMINATED", nbytes, 0);
+                break;
+            }
+            else if (rqh.command_num == 1) {
+                char buffer[rqh.message+1];
+                buffer[rqh.message] = '\0';
+                // memset(buffer, 0, rqh.message);
+                recv(newsockfd, buffer, rqh.message, 0);
+                int nbytes = strlen("JOB <job_,> SUBMITTED")+rqh.message+1+ID_MAX_DIGITS+1;
+                char response_buffer[nbytes];
+                memset(response_buffer, 0, nbytes);
+                int n = sprintf(response_buffer, "JOB <job_%d,%s> SUBMITTED", job_id++, buffer);
+                send(newsockfd, &n, sizeof(int), 0);
+                send(newsockfd, response_buffer, n, 0);
+                send(newsockfd, &rqh.message, sizeof(int), 0);
+                send(newsockfd, buffer, rqh.message, 0);
+            }*/
             args.sockfd = newsockfd;
             pthread_t controller;
             pthread_create(&controller,NULL,controllerThread,&args);
@@ -136,19 +165,18 @@ int main(int argc, char** argv){
         pthread_join(w_threads[0],NULL);
     }
     printf("All jobs are done\n");
-    // close(sockfd);
-    // close(newsockfd);
+    close(sockfd);
+    close(newsockfd);
     return  0;
 }
 
 void* controllerThread(void* arg){
     thread_args* args = arg;
 
-    pthread_t self = pthread_self();
     request_header rqh;
     int bytes_read = 0;
     while (bytes_read < sizeof(request_header)) {
-        int nbytes = recv(args->sockfd, &rqh + bytes_read, sizeof(request_header)-bytes_read, 0);
+        int nbytes = recv(args->sockfd, (char*)&rqh + bytes_read, sizeof(request_header)-bytes_read, 0);
         if (nbytes == -1) {
             perror("recv");
             return NULL;
@@ -160,11 +188,15 @@ void* controllerThread(void* arg){
     int n = 0; //response_buffer len;
     struct iovec* iov;
     struct msghdr msg;
+
     switch (rqh.command_num) {
         case 1:
             Job *job = malloc(sizeof(Job));
-            job->pid = -1;
+            pthread_mutex_lock(&mutex_jid);
+            job->id = job_id++;
+            pthread_mutex_unlock(&mutex_jid);
             bytes_read = 0;
+            job->sockfd = args->sockfd;
             job->description = malloc(rqh.message+1);
             job->description[rqh.message] = '\0';
             while (bytes_read < rqh.message) {
@@ -177,6 +209,8 @@ void* controllerThread(void* arg){
             }
             job->description_argc = rqh.arg_count;
             job->description_len  = rqh.message;
+            response_buffer = calloc(strlen("JOB <job_,> SUBMITTED")+ID_MAX_DIGITS+rqh.message+1,sizeof(char)); //20 gia MAX psifia kai 1 gia nullbyte
+            n = sprintf(response_buffer, "JOB <job_%d,%s> SUBMITTED", job->id,job->description) + 1;
             pthread_mutex_lock(&mutex_cond);
             while (args->buffer->count >= args->buffer->size) {
                 pthread_cond_wait(&cond_controller, &mutex_cond);
@@ -185,12 +219,22 @@ void* controllerThread(void* arg){
                 rbuffer_enqueue(args->buffer, job);
                 pthread_mutex_unlock(&mutex_cond);
                 pthread_cond_signal(&cond_worker);
+                send(args->sockfd, &n, sizeof(int), 0);
+                send(args->sockfd, response_buffer, n, 0);
+                //need to send job submitted message
+                // send(args->sockfd, &job->id, sizeof(int), 0);
             }
             else {
                 pthread_mutex_unlock(&mutex_cond);
             }
             break;
         case 2:
+            pthread_mutex_lock(&mutex_concurrency);
+            concurrency_level = rqh.message;
+            pthread_mutex_unlock(&mutex_concurrency);
+            pthread_cond_broadcast(&cond_worker);
+            break;
+        case 3:
             pthread_mutex_lock(&mutex_cond);
             job = rbuffer_remove(args->buffer,rqh.message);
             pthread_mutex_unlock(&mutex_cond);
@@ -204,7 +248,7 @@ void* controllerThread(void* arg){
             send(args->sockfd,response_buffer,n,0);
             free(response_buffer);
             break;
-        case 3:
+        case 4:
             pthread_mutex_lock(&mutex_cond);
             iov = malloc(args->buffer->count+1*sizeof(struct iovec));
             // iov[0].iov_base =
@@ -221,12 +265,9 @@ void* controllerThread(void* arg){
             sendmsg(args->sockfd,&msg,0);
             pthread_mutex_lock(&mutex_cond);
             break;
-        case 4:
-
-            break;
         case 5:
-            write(args->exit_pipe,"q",1);
             pthread_mutex_lock(&mutex_cond);
+            write(args->exit_pipe,"q",1);
             for (int i = args->buffer->start; i != args->buffer->end; i = (++i == args->buffer->size ? 0 : i)){
                 free(args->buffer->jobs[i]->description);
                 free(args->buffer->jobs[i]);
@@ -237,54 +278,111 @@ void* controllerThread(void* arg){
         default:
             break;
     }
+    free(response_buffer);
+    free(iov);
     // printf("Controller thread %d\n",*id);
     return NULL;
 }
 
 void* workerThread(void* arg){
     thread_args* args = arg;
-    args->buffer;
+    ring_buffer* rbuffer = args->buffer;
+    int sockfd;
     while(!quit){
         pthread_mutex_lock(&mutex_cond);
-        while(args->buffer->count == 0 && num_workers == args->buffer->concurrency_level){
+        while(rbuffer->count == 0 || num_workers == concurrency_level){
             pthread_cond_wait(&cond_worker,&mutex_cond);
             if(quit){
                 return NULL;
             }
         }
         num_workers++;
-        Job* job = rbuffer_dequeue(args->buffer);
+        Job* job = rbuffer_dequeue(rbuffer);
         pthread_mutex_unlock(&mutex_cond);
         pthread_cond_signal(&cond_controller);
+        printf("Worker thread obtained job_%d\n",job->id);
         char buffer[strlen(".output")+ID_MAX_DIGITS+1];
-        buffer[0] = '\0';
+        buffer[sizeof buffer - 1] = '\0';
         pid_t pid = fork();
-        sprintf(buffer,"%d.output",job->id);
         if(pid == -1){
             perror("fork");
             exit(EXIT_FAILURE);
         }
         if(pid == 0) {
+            sprintf(buffer,"%d.output",getpid());
             char** job_args = tokenize(job->description, job->description_argc);
-            int output_fd = open(buffer, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            dup2(STDOUT_FILENO,output_fd);
-            close(STDOUT_FILENO);
+            // for(int i=0;i<job->description_argc;i++){
+                // printf("%s ",job_args[i]);
+            // }
+            int output_fd = open(buffer, O_WRONLY | O_CREAT, 0666);
+            if(output_fd == -1){
+                perror("open wr");
+                exit(EXIT_FAILURE);
+            }
+            // printf("opened %s\n",buffer);
+            dup2(output_fd,STDOUT_FILENO);
+            close(output_fd);
             execvp(job_args[0],job_args);
+            printf("execvp failed\n");
             exit(EXIT_FAILURE);
         }
         waitpid(pid,NULL, 0);
+        sprintf(buffer,"%d.output",pid);
         int output_fd = open(buffer, O_RDONLY);
-        char bumper[strlen("-----job_ output start---") + ID_MAX_DIGITS + 1];
-        bumper[sizeof(bumper)-1] = '\0';
-        int n = sprintf(bumper, "----job_%d output start----", job->id);
-        write(args->sockfd, bumper, n+1);
+        if(output_fd == -1){
+            fprintf(stderr,"can't open %s\n",buffer);
+            exit(EXIT_FAILURE);
+        }
+        int bumper_len = strlen("\n-----job_ output start---\n") + ID_MAX_DIGITS + 1;
         struct stat st;
-        lstat(buffer, &st);
-        sendfile(args->sockfd, output_fd, 0, st.st_size);
-        memset(bumper, 0, sizeof(bumper));
-        sprintf(bumper, "----job_%d output end------", job->id);
-        write(args->sockfd, bumper, n+1);
+        if(lstat(buffer, &st)==-1){
+            perror("lstat");
+            exit(EXIT_FAILURE);
+        }
+        char bumper1[bumper_len];
+        char bumper2[bumper_len];
+        bumper1[sizeof(bumper1)] = '\0';
+        bumper2[sizeof(bumper2)] = '\0';
+        int n1 = sprintf(bumper1, "\n----job_%d output start----\n", job->id);
+        int n2 = sprintf(bumper2, "\n-----job_%d output end-----\n", job->id);
+        int n = n2+n1+st.st_size+1;
+        // printf("%d+%d+%d+1\n",n2,n1,st.st_size);
+        // printf("%d+%d+%d+1\n",strlen(bumper2),strlen(bumper1),st.st_size);
+        // printf("%d+%d+%d+1\n",bumper_len,bumper_len,st.st_size);
+        sockfd = job->sockfd;
+        printf("n: %d\n",n);
+        if(send(job->sockfd, &n,sizeof(int),0)==-1) {
+            perror("send");
+            exit(EXIT_FAILURE);
+        }
+        printf("sent %d\n",n);
+        send(sockfd, bumper1, n1,0);
+        /*char outputbuffer[st.st_size];
+        memset(outputbuffer,0,st.st_size);
+        if(read(output_fd,outputbuffer,st.st_size)==-1) {
+            perror("read");
+            fprintf(stderr, "errno:%s\n", strerrorname_np(errno));
+        }
+        if(send(sockfd,outputbuffer,st.st_size,0)==-1) {
+            perror("send");
+            fprintf(stderr, "errno:%s\n", strerrorname_np(errno));
+        }*/
+
+        int bytes_sent = 0;
+        off_t offset = 0;
+        while (bytes_sent < st.st_size) {
+            int nbytes = sendfile(sockfd, output_fd, &offset, st.st_size-bytes_sent);
+            if (nbytes == -1) {
+                perror("sendfile");
+                fprintf(stderr, "errno:%s\n", strerrorname_np(errno));
+                exit(EXIT_FAILURE);
+            }
+            bytes_sent += nbytes;
+        }
+        send(sockfd, bumper2, n2+1,0);
         free(job);
+        close(output_fd);
+        unlink(buffer);
         // printf("Worker thread obtained job_%d\n",job->id);
     }
     return NULL;

@@ -8,7 +8,7 @@
 #include <stddef.h>
 typedef struct Job {
     int id;
-    pid_t pid;
+    int sockfd;
     char* description;
     int description_argc;
     int description_len;
@@ -18,10 +18,11 @@ typedef struct Job {
 typedef struct ring_buffer {
     Job **jobs;
     int size;
-    int start;
-    int end;
+    int start; //read
+    int end;   //write
+    //full: start+1 == end
+    //empty: start == end
     int count;
-    int concurrency_level;
 } ring_buffer;
 void rbuffer_init(ring_buffer*, int);
 Job* rbuffer_getJob(ring_buffer*, int);
